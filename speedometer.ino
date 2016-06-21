@@ -32,27 +32,48 @@ static Bounce debouncer = Bounce();
 static CRGB leds[NUM_LEDS];
 static uint8_t displayed_number = 99; // Number displayed on nixie tubes
 
-struct SavedConfigType {
+class SavedConfigType {
+public:
   uint8_t check_byte;
   uint8_t led_brightness;
   uint8_t led_scale[NUM_SECTIONS];
   uint8_t led_pattern;
   uint8_t led_pattern_arg;
+  uint8_t led_pattern_overlay;
   int     led_animation_speed;
+  uint8_t led_animation_step;
   uint8_t led_speed_multiplier_enable;
   uint8_t speed_enable;
-};
 
-static SavedConfigType saved = {
-  .check_byte                  = 0xAD,
-  .led_brightness              = 128,
-  .led_scale                   = {255, 255, 255, 255},
-  .led_pattern                 = 0,
-  .led_pattern_arg             = 0,
-  .led_animation_speed         = 20,
-  .led_speed_multiplier_enable = 0,
-  .speed_enable                = 1
+  SavedConfigType() :
+    check_byte(0xAF),
+    led_brightness(128),
+    led_scale({255, 255, 255, 255}),
+    led_pattern(0),
+    led_pattern_arg(0),
+    led_pattern_overlay(0),
+    led_animation_speed(20),
+    led_animation_step(1),
+    led_speed_multiplier_enable(0),
+    speed_enable(1)
+  {}
+
+  void save() {
+    EEPROM.put(0, *this);    
+  }
+
+  // Determine if EEPROM is initialized and read it if so, otherwise initialize it for next time
+  void load() {
+    uint8_t read_check_byte;
+    EEPROM.get(0, read_check_byte);
+    if(read_check_byte == check_byte) {
+      EEPROM.get(0, *this);
+    } else {
+      save();
+    }
+  }
 };
+static SavedConfigType saved;
 
 // Mapping to the required bit pattern
 #define LEFT_TUBE 0
@@ -73,6 +94,8 @@ const static int digit_pattern[][2] = {
   {0x000, 0x000} // Blank
 };
 
+typedef void (*PatternFunc)(uint8_t anim_idx);
+
 void setup() {
   // Initialize speed display
   pinMode(DISP_DATA_PIN, OUTPUT);
@@ -89,12 +112,8 @@ void setup() {
   debouncer.attach(SPEED_SENSOR_PIN);
   debouncer.interval(5); // interval in ms
 
-  // Determine if EEPROM is initialized and read it if so, otherwise initialize it for next time
-  uint8_t check_byte;
-  EEPROM.get(0, check_byte);
-  if(check_byte == saved.check_byte) {
-    EEPROM.get(0, saved);
-  }
+  // Init configuration
+  saved.load();
   
   // Initalize LEDs
   pinMode(UC_LED_PIN, OUTPUT);
@@ -111,6 +130,7 @@ void setup() {
   Serial.println(F("Ready!"));
   update_display(99);
 }
+
 
 void loop() {
   static unsigned long last_tick_time = millis();
@@ -147,17 +167,17 @@ void loop() {
     Serial.print(cmd);
     
     if(cmd == 'd') {
-      update_display(bt_serial_read_arg());
+      //update_display(bt_serial_read_arg());
       
     } else if(cmd == 'e') {
       saved.speed_enable = bt_serial_read_arg();
-      update_saved_config();
+      saved.save();
       
     } else if(cmd == 'b') {
       saved.led_brightness = bt_serial_read_arg();
       FastLED.setBrightness(saved.led_brightness);
       led_show_scaled();
-      update_saved_config;
+      saved.save();
       
     } else if(cmd == 's') {
       for(uint8_t i = 0; i < NUM_SECTIONS; i++) {
@@ -165,20 +185,28 @@ void loop() {
       }      
       
       led_show_scaled();
-      update_saved_config();
+      saved.save();
       
     } else if(cmd == 'p') {
       saved.led_pattern     = bt_serial_read_arg();
       saved.led_pattern_arg = bt_serial_read_arg();
-      update_saved_config();
+      saved.save();
       
     } else if(cmd == 'a') {
       saved.led_animation_speed = bt_serial_read_arg();
-      update_saved_config();
+      saved.save();
       
     } else if(cmd == 'm') {
       saved.led_speed_multiplier_enable = bt_serial_read_arg();
-      update_saved_config();
+      saved.save();
+
+    } else if(cmd == 't') {
+      saved.led_animation_step = bt_serial_read_arg();
+      saved.save();
+
+    } else if(cmd == 'o') {
+      saved.led_pattern_overlay = bt_serial_read_arg();
+      saved.save();
       
     } else if(cmd == 'h') {
       Serial.print(F("\n"
@@ -254,12 +282,6 @@ int bt_serial_read_arg()
   return arg;
 }
 
-// Save configuration to EEPROM after changes
-void update_saved_config()
-{
-  EEPROM.put(0, saved);
-}
-
 // Write pattern to LED strip if required
 void update_pattern()
 {
@@ -267,6 +289,7 @@ void update_pattern()
   static uint8_t last_pattern_arg = 99;
   static bool last_animated = true;
   static unsigned long last_update_time = millis();
+  static uint8_t anim_idx;
 
   // Trying to make an option for animation speed to be proportional to riding speed -- not there yet
   int anim_speed = saved.led_animation_speed;
@@ -282,20 +305,25 @@ void update_pattern()
 
   if(new_pattern || stopping_animation || (animated && frame_time)) {
     last_update_time = millis();
+    anim_idx += saved.led_animation_step;
 
     // Update the pattern
     switch(saved.led_pattern) {
-      case 0: pattern_rainbow(); break;
-      case 1: pattern_pulse(); break;
-      case 2: pattern_chase(); break;
-      case 3: pattern_chase2(); break;
-      case 4: pattern_solid(); break;
-      case 5: pattern_noise(); break;
-      case 6: pattern_blinky(); break;
-      case 7: pattern_pulse2(); break;
+      case 0: pattern_rainbow(anim_idx); break;
+      case 1: pattern_pulse(anim_idx); break;
+      case 2: pattern_chase(anim_idx); break;
+      case 3: pattern_chase2(anim_idx); break;
+      case 4: pattern_solid(anim_idx); break;
+      case 5: pattern_noise(anim_idx); break;
+      case 6: pattern_blinky(anim_idx); break;
+      case 7: pattern_pulse2(anim_idx); break;
       default:
         FastLED.clear();
         break;
+    }
+
+    switch(saved.led_pattern_overlay) {
+      case 1: pattern_overlay_sparkle(anim_idx); break;
     }
   
     led_show_scaled();
@@ -307,7 +335,7 @@ void update_pattern()
 }
 
 // Blink the back section of the bike
-void pattern_blinky()
+void pattern_blinky(uint8_t anim_idx)
 {
   static bool on = true;
 
@@ -320,7 +348,7 @@ void pattern_blinky()
 }
 
 // Random variations in value
-void pattern_noise()
+void pattern_noise(uint8_t anim_idx)
 {
   for(uint8_t i = 0; i < NUM_LEDS; i++) {
     leds[i] = CHSV(saved.led_pattern_arg, 255, random8());
@@ -328,62 +356,58 @@ void pattern_noise()
 }
 
 // Solid color
-void pattern_solid()
+void pattern_solid(uint8_t anim_idx)
 {
   fill_solid(leds, NUM_LEDS, CHSV(saved.led_pattern_arg, 255, 255));
 }
 
 // Small group of LEDs circles the strip
-void pattern_chase()
+void pattern_chase(uint8_t anim_idx)
 {
-  static uint8_t i = 0;
-
   FastLED.clear();
-  leds[(i + 0) % NUM_LEDS] = CHSV(saved.led_pattern_arg, 255, 50);
-  leds[(i + 1) % NUM_LEDS] = CHSV(saved.led_pattern_arg, 255, 128);
-  leds[(i + 2) % NUM_LEDS] = CHSV(saved.led_pattern_arg, 255, 255);
-  leds[(i + 3) % NUM_LEDS] = CHSV(saved.led_pattern_arg, 255, 128);
-  leds[(i + 3) % NUM_LEDS] = CHSV(saved.led_pattern_arg, 255, 50);
-  i++;
+  leds[(anim_idx + 0) % NUM_LEDS] = CHSV(saved.led_pattern_arg, 255, 50);
+  leds[(anim_idx + 1) % NUM_LEDS] = CHSV(saved.led_pattern_arg, 255, 128);
+  leds[(anim_idx + 2) % NUM_LEDS] = CHSV(saved.led_pattern_arg, 255, 255);
+  leds[(anim_idx + 3) % NUM_LEDS] = CHSV(saved.led_pattern_arg, 255, 128);
+  leds[(anim_idx + 3) % NUM_LEDS] = CHSV(saved.led_pattern_arg, 255, 50);
 }
 
 // Color pulse moves to the back of the bike from the top and bottom simultaneously
-void pattern_chase2()
+void pattern_chase2(uint8_t anim_idx)
 {
-  static uint8_t i = 0;
   uint8_t len = min(L_TOP_NUM + L_BACK_NUM, L_DOWN_NUM + L_CHAIN_NUM);
 
   FastLED.clear();
-  leds[(i + 0) % len] = CHSV(saved.led_pattern_arg, 255, 128);
-  leds[(i + 1) % len] = CHSV(saved.led_pattern_arg, 255, 255);
-  leds[NUM_LEDS - (i + 1) % len - 1] = CHSV(saved.led_pattern_arg, 255, 255);
-  leds[NUM_LEDS - (i + 0) % len - 1] = CHSV(saved.led_pattern_arg, 255, 128);
-  i++;
+  leds[(anim_idx + 0) % len] = CHSV(saved.led_pattern_arg, 255, 128);
+  leds[(anim_idx + 1) % len] = CHSV(saved.led_pattern_arg, 255, 255);
+  leds[NUM_LEDS - (anim_idx + 1) % len - 1] = CHSV(saved.led_pattern_arg, 255, 255);
+  leds[NUM_LEDS - (anim_idx + 0) % len - 1] = CHSV(saved.led_pattern_arg, 255, 128);
 }
 
 // Pulse from max value to black
-void pattern_pulse()
+void pattern_pulse(uint8_t anim_idx)
 {
-  static uint8_t angle;
-  fill_solid(leds, NUM_LEDS, CHSV(saved.led_pattern_arg, 255, cubicwave8(angle++)));
+  fill_solid(leds, NUM_LEDS, CHSV(saved.led_pattern_arg, 255, cubicwave8(anim_idx++)));
 }
 
 // Pulse from max value to 1/4 value
-void pattern_pulse2()
+void pattern_pulse2(uint8_t anim_idx)
 {
-  static uint8_t angle;
-  fill_solid(leds, NUM_LEDS, CHSV(saved.led_pattern_arg, 255, qadd8(cubicwave8(angle++) / 4 * 3, 64)));
+  fill_solid(leds, NUM_LEDS, CHSV(saved.led_pattern_arg, 255, qadd8(cubicwave8(anim_idx++) / 4 * 3, 64)));
 }
 
 // Show either all rainbow colors around the strip or cycle between all colors
-void pattern_rainbow()
+void pattern_rainbow(uint8_t anim_idx)
 {
-  static uint8_t offset = 0;
-  
   if(saved.led_pattern_arg == 0) {
-    fill_rainbow(leds, NUM_LEDS, offset++, 255 / NUM_LEDS);
+    fill_rainbow(leds, NUM_LEDS, anim_idx++, 255 / NUM_LEDS);
   } else {
-    fill_solid(leds, NUM_LEDS, CHSV(offset++, 255, 255));
+    fill_solid(leds, NUM_LEDS, CHSV(anim_idx++, 255, 255));
   }
+}
+
+void pattern_overlay_sparkle(uint8_t anim_idx)
+{
+  leds[random8(NUM_LEDS)] = CRGB::White;
 }
 
