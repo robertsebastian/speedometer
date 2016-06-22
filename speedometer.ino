@@ -26,6 +26,8 @@
 #define L_DOWN_END 50
 #define L_DOWN_NUM 17
 
+#define arr_len(arr) (sizeof(arr) / sizeof(arr[0]))
+
 const static float tire_radius_mm = 335.0;
 
 static Bounce debouncer = Bounce();
@@ -94,9 +96,32 @@ const static int digit_pattern[][2] = {
   {0x000, 0x000} // Blank
 };
 
-typedef void (*PatternFunc)(uint8_t anim_idx);
+
+struct PatternInfo {
+  typedef void (*PatternFunc)(uint8_t anim_idx);
+  
+  PatternFunc func;
+  const __FlashStringHelper *name;
+
+  PatternInfo() : func(NULL), name(NULL) {}
+  PatternInfo(PatternFunc func_, const __FlashStringHelper *name_) : func(func_), name(name_) {}
+};
+
+static PatternInfo patterns[11];
 
 void setup() {
+  patterns[0]  = PatternInfo(pattern_rainbow,  F("Rainbow"));
+  patterns[1]  = PatternInfo(pattern_rainbow2, F("Rainbow 2"));
+  patterns[2]  = PatternInfo(pattern_pulse,    F("Pulse"));
+  patterns[3]  = PatternInfo(pattern_pulse2,   F("Pulse 2")); 
+  patterns[4]  = PatternInfo(pattern_chase,    F("Chase"));
+  patterns[5]  = PatternInfo(pattern_chase2,   F("Chase 2"));
+  patterns[6]  = PatternInfo(pattern_solid,    F("Solid"));
+  patterns[7]  = PatternInfo(pattern_noise,    F("Noise"));
+  patterns[8]  = PatternInfo(pattern_blinky,   F("Blinky"));
+  patterns[9]  = PatternInfo(overlay_sparkle,  F("Sparkle"));
+  patterns[10] = PatternInfo(overlay_sparkle2, F("Sparkle 2"));
+  
   // Initialize speed display
   pinMode(DISP_DATA_PIN, OUTPUT);
   pinMode(DISP_CLOCK_PIN, OUTPUT);
@@ -109,8 +134,8 @@ void setup() {
 
   // Initialize speed sensor
   pinMode(SPEED_SENSOR_PIN, INPUT_PULLUP);
-  debouncer.attach(SPEED_SENSOR_PIN);
-  debouncer.interval(5); // interval in ms
+  //debouncer.attach(SPEED_SENSOR_PIN);
+  //debouncer.interval(5); // interval in ms
 
   // Init configuration
   saved.load();
@@ -131,7 +156,6 @@ void setup() {
   update_display(99);
 }
 
-
 void loop() {
   static unsigned long last_tick_time = millis();
   static unsigned int speed_disp = 0;
@@ -141,8 +165,9 @@ void loop() {
   unsigned long elapsed_time = curr_time - last_tick_time;  
 
   // Speedometer logic
-  debouncer.update();
-  int speed_pin = debouncer.read();
+  //debouncer.update();
+  //int speed_pin = debouncer.read();
+  int speed_pin = digitalRead(SPEED_SENSOR_PIN);
 
   if(speed_pin != last_speed_pin) {
     last_speed_pin = speed_pin;
@@ -207,6 +232,14 @@ void loop() {
     } else if(cmd == 'o') {
       saved.led_pattern_overlay = bt_serial_read_arg();
       saved.save();
+
+    } else if(cmd == 'l') {
+      Serial.println(F("[patterns]"));
+      for(uint8_t i = 0; i < arr_len(patterns); i++) {
+        Serial.print(i);
+        Serial.print(':');
+        Serial.println(patterns[i].name);
+      }
       
     } else if(cmd == 'h') {
       Serial.print(F("\n"
@@ -217,16 +250,7 @@ void loop() {
         "p<num>,<arg>: Set LED pattern\n"
         "a<val>: Set LED animation speed (0 == off)\n"
         "m<1|0>: Set LED speed multiplier enable\n"
-        "\n"
-        "Patterns:\n"
-        "0: rainbow\n"
-        "1: pulse\n"
-        "2: chase\n"
-        "3: chase2\n"
-        "4: solid\n"
-        "5: noise\n"
-        "6: blinky\n"
-        "7: pulse2\n"
+        "l: Show patterns and overlays\n"
         ));
     }
     
@@ -308,22 +332,14 @@ void update_pattern()
     anim_idx += saved.led_animation_step;
 
     // Update the pattern
-    switch(saved.led_pattern) {
-      case 0: pattern_rainbow(anim_idx); break;
-      case 1: pattern_pulse(anim_idx); break;
-      case 2: pattern_chase(anim_idx); break;
-      case 3: pattern_chase2(anim_idx); break;
-      case 4: pattern_solid(anim_idx); break;
-      case 5: pattern_noise(anim_idx); break;
-      case 6: pattern_blinky(anim_idx); break;
-      case 7: pattern_pulse2(anim_idx); break;
-      default:
-        FastLED.clear();
-        break;
+    FastLED.clear();
+    
+    if(saved.led_pattern < arr_len(patterns)) {
+      patterns[saved.led_pattern].func(anim_idx);
     }
-
-    switch(saved.led_pattern_overlay) {
-      case 1: pattern_overlay_sparkle(anim_idx); break;
+    
+    if(saved.led_pattern_overlay < arr_len(patterns)) {
+      patterns[saved.led_pattern_overlay].func(anim_idx);
     }
   
     led_show_scaled();
@@ -339,9 +355,10 @@ void pattern_blinky(uint8_t anim_idx)
 {
   static bool on = true;
 
-  FastLED.clear();
   if(on || saved.led_animation_speed == 0) {
     fill_solid(leds + L_BACK_START, L_BACK_NUM, CHSV(saved.led_pattern_arg, 255, 255));
+  } else {
+    fill_solid(leds + L_BACK_START, L_BACK_NUM, CRGB::Black);
   }
   
   on = !on;
@@ -364,7 +381,6 @@ void pattern_solid(uint8_t anim_idx)
 // Small group of LEDs circles the strip
 void pattern_chase(uint8_t anim_idx)
 {
-  FastLED.clear();
   leds[(anim_idx + 0) % NUM_LEDS] = CHSV(saved.led_pattern_arg, 255, 50);
   leds[(anim_idx + 1) % NUM_LEDS] = CHSV(saved.led_pattern_arg, 255, 128);
   leds[(anim_idx + 2) % NUM_LEDS] = CHSV(saved.led_pattern_arg, 255, 255);
@@ -377,7 +393,6 @@ void pattern_chase2(uint8_t anim_idx)
 {
   uint8_t len = min(L_TOP_NUM + L_BACK_NUM, L_DOWN_NUM + L_CHAIN_NUM);
 
-  FastLED.clear();
   leds[(anim_idx + 0) % len] = CHSV(saved.led_pattern_arg, 255, 128);
   leds[(anim_idx + 1) % len] = CHSV(saved.led_pattern_arg, 255, 255);
   leds[NUM_LEDS - (anim_idx + 1) % len - 1] = CHSV(saved.led_pattern_arg, 255, 255);
@@ -399,15 +414,21 @@ void pattern_pulse2(uint8_t anim_idx)
 // Show either all rainbow colors around the strip or cycle between all colors
 void pattern_rainbow(uint8_t anim_idx)
 {
-  if(saved.led_pattern_arg == 0) {
-    fill_rainbow(leds, NUM_LEDS, anim_idx++, 255 / NUM_LEDS);
-  } else {
-    fill_solid(leds, NUM_LEDS, CHSV(anim_idx++, 255, 255));
-  }
+  fill_rainbow(leds, NUM_LEDS, anim_idx++, 255 / NUM_LEDS);
 }
 
-void pattern_overlay_sparkle(uint8_t anim_idx)
+void pattern_rainbow2(uint8_t anim_idx)
+{
+  fill_solid(leds, NUM_LEDS, CHSV(anim_idx++, 255, 255));
+}
+
+void overlay_sparkle(uint8_t anim_idx)
 {
   leds[random8(NUM_LEDS)] = CRGB::White;
 }
 
+void overlay_sparkle2(uint8_t anim_idx)
+{
+  leds[random8(NUM_LEDS)] = CRGB::White;
+  leds[random8(NUM_LEDS)] = CRGB::White;
+}
