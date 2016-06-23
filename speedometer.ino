@@ -44,6 +44,10 @@ static bool layers_updated = false;
 struct PatternLayer {
   uint8_t num;
   uint8_t arg[N_PATTERN_ARGS];
+  int     speed;
+  uint8_t step;
+
+  PatternLayer() : speed(20), step(1) {}
 };
 
 struct SavedConfigType {
@@ -51,18 +55,12 @@ struct SavedConfigType {
   uint8_t      led_brightness;
   uint8_t      led_scale[NUM_SECTIONS];
   PatternLayer layers[N_PATTERN_LAYERS];
-  int          led_animation_speed;
-  uint8_t      led_animation_step;
-  uint8_t      led_speed_multiplier_enable;
   uint8_t      speed_enable;
 
   SavedConfigType() :
-    check_byte(0xA1),
+    check_byte(0xA3),
     led_brightness(128),
     led_scale({255, 255, 255, 255}),
-    led_animation_speed(20),
-    led_animation_step(1),
-    led_speed_multiplier_enable(0),
     speed_enable(1)
   {}
 
@@ -168,7 +166,7 @@ void loop() {
     update_display(speed_mph);
   }
 
-  update_pattern();
+  update_layers();
   process_inputs();
 }
 
@@ -201,7 +199,7 @@ void process_inputs()
       saved.save();
       
     } else if(cmd == 'p') {
-      uint8_t layer  = bt_serial_read_arg() % N_PATTERN_LAYERS;
+      uint8_t layer = bt_serial_read_arg() % N_PATTERN_LAYERS;
       saved.layers[layer].num = bt_serial_read_arg();
       for(uint8_t i = 0; i < N_PATTERN_ARGS; i++) {
         saved.layers[layer].arg[i] = bt_serial_read_arg();
@@ -210,15 +208,13 @@ void process_inputs()
 
       layers_updated = true;
     } else if(cmd == 'a') {
-      saved.led_animation_speed = bt_serial_read_arg();
-      saved.save();
-      
-    } else if(cmd == 'm') {
-      saved.led_speed_multiplier_enable = bt_serial_read_arg();
+      uint8_t layer = bt_serial_read_arg() % N_PATTERN_LAYERS;
+      saved.layers[layer].speed = bt_serial_read_arg();
       saved.save();
 
     } else if(cmd == 't') {
-      saved.led_animation_step = bt_serial_read_arg();
+      uint8_t layer = bt_serial_read_arg() % N_PATTERN_LAYERS;
+      saved.layers[layer].step = bt_serial_read_arg();
       saved.save();
 
     } else if(cmd == 'l') {
@@ -334,53 +330,53 @@ int bt_serial_read_arg()
 }
 
 // Write pattern to LED strip if required
-void update_pattern()
+void update_layers()
 {
-  static bool last_animated = true;
-  static unsigned long last_update_time = millis();
-  static uint8_t anim_idx;
+  static unsigned long last_update_time[N_PATTERN_LAYERS];
+  static uint8_t anim_idx[N_PATTERN_LAYERS];
 
-  // Trying to make an option for animation speed to be proportional to riding speed -- not there yet
-  int anim_speed = saved.led_animation_speed;
-  if(saved.led_speed_multiplier_enable) {
-    anim_speed -= max(anim_speed, anim_speed * (int)displayed_number / 30);
+  // Determine if an update is required for any layer
+  bool update_required = layers_updated;
+  for(uint8_t layer_idx = 0; layer_idx < N_PATTERN_LAYERS; layer_idx++) {
+    const PatternLayer & layer = saved.layers[layer_idx];
+    
+    // Nothing to do if this is an empty layer
+    if(layer.num < 1 || layer.num > arr_len(patterns)) continue;
+    
+    update_required = update_required || (millis() - last_update_time[layer_idx]) > layer.speed;
   }
 
-  // Figure out if we need to update the animation frame
-  bool animated = anim_speed != 0;
-  bool stopping_animation = last_animated && !animated;
-  bool frame_time = (millis() - last_update_time) > anim_speed;
+  // If no layer requires an update, nothing to do
+  if(!update_required) return;
 
-  if(layers_updated || stopping_animation || (animated && frame_time)) {
-    last_update_time = millis();
-    anim_idx += saved.led_animation_step;
+  for(uint8_t layer_idx = 0; layer_idx < N_PATTERN_LAYERS; layer_idx++) {
+    const PatternLayer & layer = saved.layers[layer_idx];
+
+    // Nothing to do if this is an empty layer
+    if(layer.num < 1 || layer.num > arr_len(patterns)) continue;
+
+    // Update animation step if requred
+    if(millis() - last_update_time[layer_idx] > layer.speed) {
+      last_update_time[layer_idx] = millis();
+      anim_idx[layer_idx] += layer.step;
+    }
 
     // Update the pattern
-    FastLED.clear();
-    for(uint8_t i = 0; i < N_PATTERN_LAYERS; i++) {
-      uint8_t layer = saved.layers[i].num;
-      if(layer > 0 && layer <= arr_len(patterns)) {
-        patterns[layer - 1].func(anim_idx, saved.layers[i]);
-      }
-    }
-    
-    led_show_scaled();
-    
-    layers_updated = false;    
+    patterns[layer.num - 1].func(anim_idx[layer_idx], layer);
   }
-  last_animated = animated;
+
+  led_show_scaled();
+  layers_updated = false;  
 }
 
 // Blink the back section of the bike
 void pattern_blinky(uint8_t anim_idx, const PatternLayer & layer)
 {
-  static bool on = true;
+  static bool on = anim_idx % 2 == 0;
 
-  if(on || saved.led_animation_speed == 0) {
+  if(on || layer.step == 0) {
     fill_solid(leds + L_BACK_START, L_BACK_NUM, CHSV(layer.arg[0], 255, 255));
   }
-  
-  on = !on;
 }
 
 // Random variations in value
@@ -394,7 +390,7 @@ void pattern_noise(uint8_t anim_idx, const PatternLayer & layer)
 // Solid color
 void pattern_solid(uint8_t anim_idx, const PatternLayer & layer)
 {
-  fill_solid(leds, NUM_LEDS, CHSV(layer.arg[0], 255, 255));
+  fill_solid(leds, NUM_LEDS, CHSV(layer.arg[0], 255, layer.arg[1]));
 }
 
 // Small group of LEDs circles the strip
@@ -422,13 +418,13 @@ void pattern_chase2(uint8_t anim_idx, const PatternLayer & layer)
 // Pulse from max value to black
 void pattern_pulse(uint8_t anim_idx, const PatternLayer & layer)
 {
-  fill_solid(leds, NUM_LEDS, CHSV(layer.arg[0], 255, cubicwave8(anim_idx++)));
+  nscale8(leds, NUM_LEDS, cubicwave8(anim_idx++));
 }
 
 // Pulse from max value to 1/4 value
 void pattern_pulse2(uint8_t anim_idx, const PatternLayer & layer)
 {
-  fill_solid(leds, NUM_LEDS, CHSV(layer.arg[0], 255, qadd8(cubicwave8(anim_idx++) / 4 * 3, 64)));
+  nscale8(leds, NUM_LEDS, qadd8(cubicwave8(anim_idx++) / 4 * 3, 64));
 }
 
 // Show either all rainbow colors around the strip or cycle between all colors
@@ -439,7 +435,7 @@ void pattern_rainbow(uint8_t anim_idx, const PatternLayer & layer)
 
 void pattern_rainbow2(uint8_t anim_idx, const PatternLayer & layer)
 {
-  fill_solid(leds, NUM_LEDS, CHSV(anim_idx++, 255, 255));
+  fill_solid(leds, NUM_LEDS, CHSV(anim_idx++, 255, layer.arg[1]));
 }
 
 void overlay_speed_mult(uint8_t anim_idx, const PatternLayer & layer)
@@ -451,11 +447,24 @@ void overlay_speed_mult(uint8_t anim_idx, const PatternLayer & layer)
 
 void overlay_sparkle(uint8_t anim_idx, const PatternLayer & layer)
 {
-  leds[random8(NUM_LEDS)] = CRGB::White;
+  static uint8_t last_anim_idx = 0;
+  static uint8_t last_led = 0;
+  if(anim_idx != last_anim_idx) {
+    last_led = random8(NUM_LEDS);
+    last_anim_idx = anim_idx;
+  }
+
+  leds[last_led] = CRGB::White;
 }
 
 void overlay_sparkle2(uint8_t anim_idx, const PatternLayer & layer)
 {
-  leds[random8(NUM_LEDS)] = CRGB::White;
-  leds[random8(NUM_LEDS)] = CRGB::White;
+  static uint8_t last_anim_idx = 0;
+  static uint8_t last_led = 0;
+  if(anim_idx != last_anim_idx) {
+    last_led = random8(NUM_LEDS);
+    last_anim_idx = anim_idx;
+  }
+
+  leds[last_led] = CRGB::White;  
 }
