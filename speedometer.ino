@@ -2,6 +2,7 @@
 #include <Bounce2.h>
 #include <EEPROM.h>
 #include <FastLED.h>
+#include <PinChangeInterrupt.h>
 
 #define DISP_DATA_PIN 2
 #define DISP_CLOCK_PIN 3
@@ -9,7 +10,6 @@
 #define SPEED_SENSOR_PIN 5
 #define LED_ENABLE_PIN 8
 #define LED_DISP_DATA_PIN 9
-#define UC_LED_PIN 13
 
 #define NUM_LEDS 51
 #define NUM_SECTIONS 4
@@ -33,27 +33,33 @@ const static float tire_radius_mm = 335.0;
 static Bounce debouncer = Bounce();
 static CRGB leds[NUM_LEDS];
 static uint8_t displayed_number = 99; // Number displayed on nixie tubes
+static uint8_t speed_mph = 0;
+static uint8_t speed_norm = 0; // Speed mapping 0-20 mph to 0-255
+static volatile bool speed_sensor_triggered = false;
+static bool layers_updated = false;
 
-class SavedConfigType {
-public:
-  uint8_t check_byte;
-  uint8_t led_brightness;
-  uint8_t led_scale[NUM_SECTIONS];
-  uint8_t led_pattern;
-  uint8_t led_pattern_arg;
-  uint8_t led_pattern_overlay;
-  int     led_animation_speed;
-  uint8_t led_animation_step;
-  uint8_t led_speed_multiplier_enable;
-  uint8_t speed_enable;
+#define N_PATTERN_ARGS 2
+#define N_PATTERN_LAYERS 3
+
+struct PatternLayer {
+  uint8_t num;
+  uint8_t arg[N_PATTERN_ARGS];
+};
+
+struct SavedConfigType {
+  uint8_t      check_byte;
+  uint8_t      led_brightness;
+  uint8_t      led_scale[NUM_SECTIONS];
+  PatternLayer layers[N_PATTERN_LAYERS];
+  int          led_animation_speed;
+  uint8_t      led_animation_step;
+  uint8_t      led_speed_multiplier_enable;
+  uint8_t      speed_enable;
 
   SavedConfigType() :
-    check_byte(0xAF),
+    check_byte(0xA1),
     led_brightness(128),
     led_scale({255, 255, 255, 255}),
-    led_pattern(0),
-    led_pattern_arg(0),
-    led_pattern_overlay(0),
     led_animation_speed(20),
     led_animation_step(1),
     led_speed_multiplier_enable(0),
@@ -98,7 +104,7 @@ const static int digit_pattern[][2] = {
 
 
 struct PatternInfo {
-  typedef void (*PatternFunc)(uint8_t anim_idx);
+  typedef void (*PatternFunc)(uint8_t anim_idx, const PatternLayer & layer);
   
   PatternFunc func;
   const __FlashStringHelper *name;
@@ -107,7 +113,7 @@ struct PatternInfo {
   PatternInfo(PatternFunc func_, const __FlashStringHelper *name_) : func(func_), name(name_) {}
 };
 
-static PatternInfo patterns[11];
+static PatternInfo patterns[12];
 
 void setup() {
   patterns[0]  = PatternInfo(pattern_rainbow,  F("Rainbow"));
@@ -121,6 +127,7 @@ void setup() {
   patterns[8]  = PatternInfo(pattern_blinky,   F("Blinky"));
   patterns[9]  = PatternInfo(overlay_sparkle,  F("Sparkle"));
   patterns[10] = PatternInfo(overlay_sparkle2, F("Sparkle 2"));
+  patterns[11] = PatternInfo(overlay_speed_mult, F("Speed overlay"));
   
   // Initialize speed display
   pinMode(DISP_DATA_PIN, OUTPUT);
@@ -134,6 +141,7 @@ void setup() {
 
   // Initialize speed sensor
   pinMode(SPEED_SENSOR_PIN, INPUT_PULLUP);
+  attachPinChangeInterrupt(digitalPinToPCINT(SPEED_SENSOR_PIN), handle_speed_sensor_pin_int, CHANGE);
   //debouncer.attach(SPEED_SENSOR_PIN);
   //debouncer.interval(5); // interval in ms
 
@@ -141,9 +149,6 @@ void setup() {
   saved.load();
   
   // Initalize LEDs
-  pinMode(UC_LED_PIN, OUTPUT);
-  digitalWrite(UC_LED_PIN, LOW);
-  
   FastLED.addLeds<WS2812, LED_DISP_DATA_PIN, GRB>(leds, NUM_LEDS).setCorrection(TypicalLEDStrip);
   FastLED.setBrightness(saved.led_brightness);  
   FastLED.show();
@@ -157,35 +162,18 @@ void setup() {
 }
 
 void loop() {
-  static unsigned long last_tick_time = millis();
-  static unsigned int speed_disp = 0;
-  static int last_speed_pin = 1;
-  
-  unsigned long curr_time = millis();
-  unsigned long elapsed_time = curr_time - last_tick_time;  
+  update_speed();
 
-  // Speedometer logic
-  //debouncer.update();
-  //int speed_pin = debouncer.read();
-  int speed_pin = digitalRead(SPEED_SENSOR_PIN);
-
-  if(speed_pin != last_speed_pin) {
-    last_speed_pin = speed_pin;
-    if(speed_pin == 0) {
-      float speed_sample = 2.0 * M_PI * 335.0 / 1609344.0 / (elapsed_time / 3600000.0f);
-      if(saved.speed_enable) update_display((int)speed_sample);
-
-      last_tick_time = curr_time;
-    }
+  if(saved.speed_enable) {
+    update_display(speed_mph);
   }
 
-  if(elapsed_time >= 4000) {
-    if(saved.speed_enable) update_display(0);
-    //last_tick_time = curr_time;
-  }
+  update_pattern();
+  process_inputs();
+}
 
-  digitalWrite(UC_LED_PIN, !speed_pin);
-
+void process_inputs()
+{
   // Accept serial commands over bluetooth
   if(Serial.available() > 0) {
     char cmd = Serial.read();
@@ -213,10 +201,14 @@ void loop() {
       saved.save();
       
     } else if(cmd == 'p') {
-      saved.led_pattern     = bt_serial_read_arg();
-      saved.led_pattern_arg = bt_serial_read_arg();
+      uint8_t layer  = bt_serial_read_arg() % N_PATTERN_LAYERS;
+      saved.layers[layer].num = bt_serial_read_arg();
+      for(uint8_t i = 0; i < N_PATTERN_ARGS; i++) {
+        saved.layers[layer].arg[i] = bt_serial_read_arg();
+      }
       saved.save();
-      
+
+      layers_updated = true;
     } else if(cmd == 'a') {
       saved.led_animation_speed = bt_serial_read_arg();
       saved.save();
@@ -229,14 +221,10 @@ void loop() {
       saved.led_animation_step = bt_serial_read_arg();
       saved.save();
 
-    } else if(cmd == 'o') {
-      saved.led_pattern_overlay = bt_serial_read_arg();
-      saved.save();
-
     } else if(cmd == 'l') {
-      Serial.println(F("[patterns]"));
+      Serial.println(F("0:off"));
       for(uint8_t i = 0; i < arr_len(patterns); i++) {
-        Serial.print(i);
+        Serial.print(i + 1);
         Serial.print(':');
         Serial.println(patterns[i].name);
       }
@@ -247,18 +235,51 @@ void loop() {
         "d<val>: Set speed display\n"
         "b<val>: Set LED overall brightness\n"
         "s<t>,<b>,<c>,<b>: Set LED scaling\n"
-        "p<num>,<arg>: Set LED pattern\n"
+        "p<layer>,<num>,<arg1>,<arg2>: Set LED pattern\n"
         "a<val>: Set LED animation speed (0 == off)\n"
         "m<1|0>: Set LED speed multiplier enable\n"
-        "l: Show patterns and overlays\n"
+        "l: Show patterns\n"
         ));
     }
     
     // Indicate doneness
     Serial.println(".");
   }
+}
 
-  update_pattern();
+void update_speed()
+{
+  static unsigned long last_tick_time = millis();
+  
+  unsigned long curr_time = millis();
+  unsigned long elapsed_time = curr_time - last_tick_time;  
+
+  if(speed_sensor_triggered) {
+    speed_sensor_triggered = false;
+    
+    float speed_calculated = 2.0 * M_PI * 335.0 / 1609344.0 / (elapsed_time / 3600000.0f);
+    speed_mph = (uint8_t)speed_calculated;
+    speed_norm = (uint8_t)min(speed_calculated / 20.0 * 255.0, 255.0);
+    
+    last_tick_time = curr_time;
+  }
+
+  if(elapsed_time >= 4000) {
+    speed_mph = 0;
+  }
+}
+
+void handle_speed_sensor_pin_int()
+{
+  static unsigned long last_trigger_time = 0;
+  unsigned long elapsed_time = millis() - last_trigger_time;
+  
+  if(digitalRead(SPEED_SENSOR_PIN) == LOW && elapsed_time > 20) {
+    speed_sensor_triggered = true;
+  }
+  if(digitalRead(SPEED_SENSOR_PIN) == LOW) {
+    last_trigger_time = millis();
+  }
 }
 
 // Shift a digit onto the nixie tube display
@@ -271,14 +292,20 @@ void shift_digit(int tube_num, int digit) {
 }
 
 // Write number to nixie tube display
-void update_display(unsigned int num)
+void update_display(uint8_t num)
 {
   if(displayed_number == num) return;
   displayed_number = num;
   
   shift_digit(LEFT_TUBE, 10);
-  shift_digit(LEFT_TUBE, (num / 10) % 10);
-  shift_digit(RIGHT_TUBE, num % 10);
+  if(num == 255) {
+    // If 255 show blank display
+    shift_digit(LEFT_TUBE, 10);
+    shift_digit(RIGHT_TUBE, 10);    
+  } else {
+    shift_digit(LEFT_TUBE, (num / 10) % 10);
+    shift_digit(RIGHT_TUBE, num % 10);
+  }
 
   digitalWrite(DISP_LATCH_PIN, HIGH);
   digitalWrite(DISP_LATCH_PIN, LOW);
@@ -309,8 +336,6 @@ int bt_serial_read_arg()
 // Write pattern to LED strip if required
 void update_pattern()
 {
-  static uint8_t last_pattern = 99;
-  static uint8_t last_pattern_arg = 99;
   static bool last_animated = true;
   static unsigned long last_update_time = millis();
   static uint8_t anim_idx;
@@ -324,110 +349,112 @@ void update_pattern()
   // Figure out if we need to update the animation frame
   bool animated = anim_speed != 0;
   bool stopping_animation = last_animated && !animated;
-  bool new_pattern = saved.led_pattern != last_pattern || saved.led_pattern_arg != last_pattern_arg;
   bool frame_time = (millis() - last_update_time) > anim_speed;
 
-  if(new_pattern || stopping_animation || (animated && frame_time)) {
+  if(layers_updated || stopping_animation || (animated && frame_time)) {
     last_update_time = millis();
     anim_idx += saved.led_animation_step;
 
     // Update the pattern
     FastLED.clear();
-    
-    if(saved.led_pattern < arr_len(patterns)) {
-      patterns[saved.led_pattern].func(anim_idx);
+    for(uint8_t i = 0; i < N_PATTERN_LAYERS; i++) {
+      uint8_t layer = saved.layers[i].num;
+      if(layer > 0 && layer <= arr_len(patterns)) {
+        patterns[layer - 1].func(anim_idx, saved.layers[i]);
+      }
     }
     
-    if(saved.led_pattern_overlay < arr_len(patterns)) {
-      patterns[saved.led_pattern_overlay].func(anim_idx);
-    }
-  
     led_show_scaled();
+    
+    layers_updated = false;    
   }
-  
-  last_pattern = saved.led_pattern;
-  last_pattern_arg = saved.led_pattern_arg;
   last_animated = animated;
 }
 
 // Blink the back section of the bike
-void pattern_blinky(uint8_t anim_idx)
+void pattern_blinky(uint8_t anim_idx, const PatternLayer & layer)
 {
   static bool on = true;
 
   if(on || saved.led_animation_speed == 0) {
-    fill_solid(leds + L_BACK_START, L_BACK_NUM, CHSV(saved.led_pattern_arg, 255, 255));
-  } else {
-    fill_solid(leds + L_BACK_START, L_BACK_NUM, CRGB::Black);
+    fill_solid(leds + L_BACK_START, L_BACK_NUM, CHSV(layer.arg[0], 255, 255));
   }
   
   on = !on;
 }
 
 // Random variations in value
-void pattern_noise(uint8_t anim_idx)
+void pattern_noise(uint8_t anim_idx, const PatternLayer & layer)
 {
   for(uint8_t i = 0; i < NUM_LEDS; i++) {
-    leds[i] = CHSV(saved.led_pattern_arg, 255, random8());
+    leds[i] = CHSV(layer.arg[0], 255, random8());
   }
 }
 
 // Solid color
-void pattern_solid(uint8_t anim_idx)
+void pattern_solid(uint8_t anim_idx, const PatternLayer & layer)
 {
-  fill_solid(leds, NUM_LEDS, CHSV(saved.led_pattern_arg, 255, 255));
+  fill_solid(leds, NUM_LEDS, CHSV(layer.arg[0], 255, 255));
 }
 
 // Small group of LEDs circles the strip
-void pattern_chase(uint8_t anim_idx)
+void pattern_chase(uint8_t anim_idx, const PatternLayer & layer)
 {
-  leds[(anim_idx + 0) % NUM_LEDS] = CHSV(saved.led_pattern_arg, 255, 50);
-  leds[(anim_idx + 1) % NUM_LEDS] = CHSV(saved.led_pattern_arg, 255, 128);
-  leds[(anim_idx + 2) % NUM_LEDS] = CHSV(saved.led_pattern_arg, 255, 255);
-  leds[(anim_idx + 3) % NUM_LEDS] = CHSV(saved.led_pattern_arg, 255, 128);
-  leds[(anim_idx + 3) % NUM_LEDS] = CHSV(saved.led_pattern_arg, 255, 50);
+  uint8_t hue = layer.arg[0];
+  leds[(anim_idx + 0) % NUM_LEDS] = CHSV(hue, 255, 50);
+  leds[(anim_idx + 1) % NUM_LEDS] = CHSV(hue, 255, 128);
+  leds[(anim_idx + 2) % NUM_LEDS] = CHSV(hue, 255, 255);
+  leds[(anim_idx + 3) % NUM_LEDS] = CHSV(hue, 255, 128);
+  leds[(anim_idx + 3) % NUM_LEDS] = CHSV(hue, 255, 50);
 }
 
 // Color pulse moves to the back of the bike from the top and bottom simultaneously
-void pattern_chase2(uint8_t anim_idx)
+void pattern_chase2(uint8_t anim_idx, const PatternLayer & layer)
 {
   uint8_t len = min(L_TOP_NUM + L_BACK_NUM, L_DOWN_NUM + L_CHAIN_NUM);
 
-  leds[(anim_idx + 0) % len] = CHSV(saved.led_pattern_arg, 255, 128);
-  leds[(anim_idx + 1) % len] = CHSV(saved.led_pattern_arg, 255, 255);
-  leds[NUM_LEDS - (anim_idx + 1) % len - 1] = CHSV(saved.led_pattern_arg, 255, 255);
-  leds[NUM_LEDS - (anim_idx + 0) % len - 1] = CHSV(saved.led_pattern_arg, 255, 128);
+  leds[(anim_idx + 0) % len] = CHSV(layer.arg[0], 255, 128);
+  leds[(anim_idx + 1) % len] = CHSV(layer.arg[0], 255, 255);
+  leds[NUM_LEDS - (anim_idx + 1) % len - 1] = CHSV(layer.arg[0], 255, 255);
+  leds[NUM_LEDS - (anim_idx + 0) % len - 1] = CHSV(layer.arg[0], 255, 128);
 }
 
 // Pulse from max value to black
-void pattern_pulse(uint8_t anim_idx)
+void pattern_pulse(uint8_t anim_idx, const PatternLayer & layer)
 {
-  fill_solid(leds, NUM_LEDS, CHSV(saved.led_pattern_arg, 255, cubicwave8(anim_idx++)));
+  fill_solid(leds, NUM_LEDS, CHSV(layer.arg[0], 255, cubicwave8(anim_idx++)));
 }
 
 // Pulse from max value to 1/4 value
-void pattern_pulse2(uint8_t anim_idx)
+void pattern_pulse2(uint8_t anim_idx, const PatternLayer & layer)
 {
-  fill_solid(leds, NUM_LEDS, CHSV(saved.led_pattern_arg, 255, qadd8(cubicwave8(anim_idx++) / 4 * 3, 64)));
+  fill_solid(leds, NUM_LEDS, CHSV(layer.arg[0], 255, qadd8(cubicwave8(anim_idx++) / 4 * 3, 64)));
 }
 
 // Show either all rainbow colors around the strip or cycle between all colors
-void pattern_rainbow(uint8_t anim_idx)
+void pattern_rainbow(uint8_t anim_idx, const PatternLayer & layer)
 {
   fill_rainbow(leds, NUM_LEDS, anim_idx++, 255 / NUM_LEDS);
 }
 
-void pattern_rainbow2(uint8_t anim_idx)
+void pattern_rainbow2(uint8_t anim_idx, const PatternLayer & layer)
 {
   fill_solid(leds, NUM_LEDS, CHSV(anim_idx++, 255, 255));
 }
 
-void overlay_sparkle(uint8_t anim_idx)
+void overlay_speed_mult(uint8_t anim_idx, const PatternLayer & layer)
+{
+  for(uint8_t i = 0; i < NUM_LEDS; i++) {
+    leds[i].nscale8(dim8_raw(speed_norm));
+  }
+}
+
+void overlay_sparkle(uint8_t anim_idx, const PatternLayer & layer)
 {
   leds[random8(NUM_LEDS)] = CRGB::White;
 }
 
-void overlay_sparkle2(uint8_t anim_idx)
+void overlay_sparkle2(uint8_t anim_idx, const PatternLayer & layer)
 {
   leds[random8(NUM_LEDS)] = CRGB::White;
   leds[random8(NUM_LEDS)] = CRGB::White;
