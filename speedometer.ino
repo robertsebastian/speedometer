@@ -38,8 +38,8 @@ static uint8_t speed_norm = 0; // Speed mapping 0-20 mph to 0-255
 static volatile bool speed_sensor_triggered = false;
 static bool layers_updated = false;
 
-#define N_PATTERN_ARGS 2
-#define N_PATTERN_LAYERS 3
+#define N_PATTERN_ARGS 3
+#define N_PATTERN_LAYERS 4
 
 struct PatternLayer {
   uint8_t num;
@@ -58,7 +58,7 @@ struct SavedConfigType {
   uint8_t      speed_enable;
 
   SavedConfigType() :
-    check_byte(0xA3),
+    check_byte(0xA4),
     led_brightness(128),
     led_scale({255, 255, 255, 255}),
     speed_enable(1)
@@ -76,6 +76,41 @@ struct SavedConfigType {
       EEPROM.get(0, *this);
     } else {
       save();
+    }
+  }
+
+  void print_state() {
+    Serial.print('b');
+    Serial.println(led_brightness);
+    Serial.print('s');
+    for(uint8_t i = 0; i < arr_len(led_scale); i++) {
+      Serial.print(led_scale[i]);
+      Serial.print(',');
+    }
+    Serial.print('\n');
+    
+    for(uint8_t layer_idx = 0; layer_idx < N_PATTERN_LAYERS; layer_idx++) {
+      const PatternLayer & layer = layers[layer_idx];
+
+      Serial.print('p');
+      Serial.print(layer_idx);
+      Serial.print(',');
+      Serial.print(layer.num);
+      for(uint8_t i = 0; i < N_PATTERN_ARGS; i++) {
+        Serial.print(',');
+        Serial.print(layer.arg[i]);
+      }
+      Serial.print('\n');
+
+      Serial.print('a');
+      Serial.print(layer_idx);
+      Serial.print(',');
+      Serial.println(layer.speed);
+      
+      Serial.print('t');
+      Serial.print(layer_idx);
+      Serial.print(',');
+      Serial.println(layer.step);
     }
   }
 };
@@ -111,21 +146,23 @@ struct PatternInfo {
   PatternInfo(PatternFunc func_, const __FlashStringHelper *name_) : func(func_), name(name_) {}
 };
 
-static PatternInfo patterns[12];
+static PatternInfo patterns[14];
 
 void setup() {
-  patterns[0]  = PatternInfo(pattern_rainbow,  F("Rainbow"));
-  patterns[1]  = PatternInfo(pattern_rainbow2, F("Rainbow 2"));
-  patterns[2]  = PatternInfo(pattern_pulse,    F("Pulse"));
-  patterns[3]  = PatternInfo(pattern_pulse2,   F("Pulse 2")); 
-  patterns[4]  = PatternInfo(pattern_chase,    F("Chase"));
-  patterns[5]  = PatternInfo(pattern_chase2,   F("Chase 2"));
-  patterns[6]  = PatternInfo(pattern_solid,    F("Solid"));
-  patterns[7]  = PatternInfo(pattern_noise,    F("Noise"));
-  patterns[8]  = PatternInfo(pattern_blinky,   F("Blinky"));
-  patterns[9]  = PatternInfo(overlay_sparkle,  F("Sparkle"));
-  patterns[10] = PatternInfo(overlay_sparkle2, F("Sparkle 2"));
-  patterns[11] = PatternInfo(overlay_speed_mult, F("Speed overlay"));
+  patterns[0]  = PatternInfo(pattern_rainbow,    F("Rainbow ()"));
+  patterns[1]  = PatternInfo(pattern_rainbow2,   F("Rainbow 2 (value)"));
+  patterns[2]  = PatternInfo(pattern_pulse,      F("Pulse ()"));
+  patterns[3]  = PatternInfo(pattern_pulse2,     F("Pulse 2 ()")); 
+  patterns[4]  = PatternInfo(pattern_chase,      F("Chase (hue)"));
+  patterns[5]  = PatternInfo(pattern_chase2,     F("Chase 2 (hue)"));
+  patterns[6]  = PatternInfo(pattern_solid,      F("Solid (h ,s, v)"));
+  patterns[7]  = PatternInfo(pattern_solid_rgb,  F("Solid (r, g, b)"));
+  patterns[8]  = PatternInfo(pattern_noise,      F("Noise"));
+  patterns[9]  = PatternInfo(pattern_blinky,     F("Blinky"));
+  patterns[10] = PatternInfo(overlay_sparkle,    F("Sparkle"));
+  patterns[11] = PatternInfo(overlay_sparkle2,   F("Sparkle 2"));
+  patterns[12] = PatternInfo(overlay_speed_mult, F("Speed overlay"));
+  patterns[13] = PatternInfo(overlay_anim_speed, F("Speed overlay 2 (layer, min, max)"));
   
   // Initialize speed display
   pinMode(DISP_DATA_PIN, OUTPUT);
@@ -140,8 +177,6 @@ void setup() {
   // Initialize speed sensor
   pinMode(SPEED_SENSOR_PIN, INPUT_PULLUP);
   attachPinChangeInterrupt(digitalPinToPCINT(SPEED_SENSOR_PIN), handle_speed_sensor_pin_int, CHANGE);
-  //debouncer.attach(SPEED_SENSOR_PIN);
-  //debouncer.interval(5); // interval in ms
 
   // Init configuration
   saved.load();
@@ -224,6 +259,9 @@ void process_inputs()
         Serial.print(':');
         Serial.println(patterns[i].name);
       }
+
+    } else if(cmd == 'c') {
+      saved.print_state();
       
     } else if(cmd == 'h') {
       Serial.print(F("\n"
@@ -231,15 +269,13 @@ void process_inputs()
         "d<val>: Set speed display\n"
         "b<val>: Set LED overall brightness\n"
         "s<t>,<b>,<c>,<b>: Set LED scaling\n"
-        "p<layer>,<num>,<arg1>,<arg2>: Set LED pattern\n"
-        "a<val>: Set LED animation speed (0 == off)\n"
-        "m<1|0>: Set LED speed multiplier enable\n"
+        "p<layer>,<num>,<arg1>,<arg2>,<arg3>: Set LED pattern\n"
+        "a<layer>,<val>: Set LED animation speed (0 == off)\n"
+        "t<layer>,<val>: Set LED animatino step\n"
+        "c: Show current configuration\n"
         "l: Show patterns\n"
         ));
     }
-    
-    // Indicate doneness
-    Serial.println(".");
   }
 }
 
@@ -390,7 +426,12 @@ void pattern_noise(uint8_t anim_idx, const PatternLayer & layer)
 // Solid color
 void pattern_solid(uint8_t anim_idx, const PatternLayer & layer)
 {
-  fill_solid(leds, NUM_LEDS, CHSV(layer.arg[0], 255, layer.arg[1]));
+  fill_solid(leds, NUM_LEDS, CHSV(layer.arg[0], layer.arg[1], layer.arg[2]));
+}
+
+void pattern_solid_rgb(uint8_t anim_idx, const PatternLayer & layer)
+{
+  fill_solid(leds, NUM_LEDS, CRGB(layer.arg[0], layer.arg[1], layer.arg[2]));
 }
 
 // Small group of LEDs circles the strip
@@ -468,3 +509,17 @@ void overlay_sparkle2(uint8_t anim_idx, const PatternLayer & layer)
 
   leds[last_led] = CRGB::White;  
 }
+
+void overlay_anim_speed(uint8_t anim_idx, const PatternLayer &layer) {
+  static uint8_t last_anim_idx;
+
+  if(anim_idx == last_anim_idx) return;
+  last_anim_idx = anim_idx;
+  
+  uint8_t tgt_layer = layer.arg[0] % N_PATTERN_LAYERS;
+  uint16_t range_low = layer.arg[1];
+  uint16_t range_high = layer.arg[2];
+
+  saved.layers[tgt_layer].speed = (range_high - range_low) * (255 - speed_norm) / 256 + range_low;
+}
+
