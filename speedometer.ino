@@ -26,6 +26,8 @@
 #define L_DOWN_END 50
 #define L_DOWN_NUM 17
 
+#define MAX_CURRENT_MA 400
+
 #define arr_len(arr) (sizeof(arr) / sizeof(arr[0]))
 
 const static float tire_radius_mm = 335.0;
@@ -35,8 +37,10 @@ static CRGB leds[NUM_LEDS];
 static uint8_t displayed_number = 99; // Number displayed on nixie tubes
 static uint8_t speed_mph = 0;
 static uint8_t speed_norm = 0; // Speed mapping 0-20 mph to 0-255
+static uint8_t layer_idx = 0;
 static volatile bool speed_sensor_triggered = false;
 static bool layers_updated = false;
+static bool made_it_through_one_loop = false;
 
 #define N_PATTERN_ARGS 3
 #define N_PATTERN_LAYERS 4
@@ -58,7 +62,7 @@ struct SavedConfigType {
   uint8_t      speed_enable;
 
   SavedConfigType() :
-    check_byte(0xA4),
+    check_byte(0xA8),
     led_brightness(128),
     led_scale({255, 255, 255, 255}),
     speed_enable(1)
@@ -70,7 +74,7 @@ struct SavedConfigType {
 
   // Determine if EEPROM is initialized and read it if so, otherwise initialize it for next time
   void load() {
-    uint8_t read_check_byte;
+    uint8_t read_check_byte, read_completed_loop_last_time;
     EEPROM.get(0, read_check_byte);
     if(read_check_byte == check_byte) {
       EEPROM.get(0, *this);
@@ -137,7 +141,7 @@ const static int digit_pattern[][2] = {
 
 
 struct PatternInfo {
-  typedef void (*PatternFunc)(uint8_t anim_idx, const PatternLayer & layer);
+  typedef void (*PatternFunc)(uint8_t & anim_idx, const PatternLayer & layer);
   
   PatternFunc func;
   const __FlashStringHelper *name;
@@ -146,23 +150,27 @@ struct PatternInfo {
   PatternInfo(PatternFunc func_, const __FlashStringHelper *name_) : func(func_), name(name_) {}
 };
 
-static PatternInfo patterns[14];
+static PatternInfo patterns[17];
 
 void setup() {
-  patterns[0]  = PatternInfo(pattern_rainbow,    F("Rainbow ()"));
-  patterns[1]  = PatternInfo(pattern_rainbow2,   F("Rainbow 2 (value)"));
-  patterns[2]  = PatternInfo(pattern_pulse,      F("Pulse ()"));
-  patterns[3]  = PatternInfo(pattern_pulse2,     F("Pulse 2 ()")); 
-  patterns[4]  = PatternInfo(pattern_chase,      F("Chase (hue)"));
-  patterns[5]  = PatternInfo(pattern_chase2,     F("Chase 2 (hue)"));
-  patterns[6]  = PatternInfo(pattern_solid,      F("Solid (h ,s, v)"));
-  patterns[7]  = PatternInfo(pattern_solid_rgb,  F("Solid (r, g, b)"));
-  patterns[8]  = PatternInfo(pattern_noise,      F("Noise"));
-  patterns[9]  = PatternInfo(pattern_blinky,     F("Blinky"));
-  patterns[10] = PatternInfo(overlay_sparkle,    F("Sparkle"));
-  patterns[11] = PatternInfo(overlay_sparkle2,   F("Sparkle 2"));
-  patterns[12] = PatternInfo(overlay_speed_mult, F("Speed overlay"));
-  patterns[13] = PatternInfo(overlay_anim_speed, F("Speed overlay 2 (layer, min, max)"));
+  patterns[0]  = PatternInfo(pattern_rainbow,    F("Rainbow"));
+  patterns[1]  = PatternInfo(pattern_rainbow2,   F("Rainbow 2,saturation,0,255,value,0,255"));
+  patterns[2]  = PatternInfo(pattern_pulse,      F("Pulse,range,0,255"));
+  patterns[3]  = PatternInfo(pattern_chase,      F("Chase circle,hue,0,255,length,0,51"));
+  patterns[4]  = PatternInfo(pattern_chase2,     F("Chase dual,hue,0,255,length,0,26"));
+  patterns[5]  = PatternInfo(pattern_solid,      F("Solid HSV,hue,0,255,saturation,0,255,value,0,255"));
+  patterns[6]  = PatternInfo(pattern_solid_rgb,  F("Solid RGB,red,0,255,green,0,255,blue,0,255"));
+  patterns[7]  = PatternInfo(pattern_noise,      F("Noise,magnitude,0,255"));
+  patterns[8]  = PatternInfo(pattern_blinky,     F("Blinky,hue,0,255,saturation,0,255,pulse width,0,255"));
+  patterns[9]  = PatternInfo(overlay_sparkle,    F("Sparkle,number,1,5,hue,0,255,saturation,0,255"));
+  patterns[10] = PatternInfo(overlay_speed_mult, F("Brightness speed overlay,min,0,255,max,0,255"));
+  patterns[11] = PatternInfo(overlay_anim_speed, F("Animation speed overlay,layer,0,3,min,0,255,max,0,255"));
+  patterns[12] = PatternInfo(pattern_murica,     F("Murica,length,1,17"));
+  patterns[13] = PatternInfo(overlay_speed_fake, F("Fake Speed,normalized speed,0,255"));
+  patterns[14] = PatternInfo(pattern_ants,       F("Marching ants,hue,0,255,length on,0,30,length off,0,30"));
+  patterns[15] = PatternInfo(pattern_dual_ants,  F("Marching ants 2,length,1,17,hue 1,0,255,hue 2,0,255"));
+  patterns[16] = PatternInfo(pattern_rainbow3,   F("Rainbow 3,length,1,7"));
+  // !!! UPDATE LENGTH OF PATTERNS ARRAY IF YOU ADD HERE !!!
   
   // Initialize speed display
   pinMode(DISP_DATA_PIN, OUTPUT);
@@ -178,11 +186,14 @@ void setup() {
   pinMode(SPEED_SENSOR_PIN, INPUT_PULLUP);
   attachPinChangeInterrupt(digitalPinToPCINT(SPEED_SENSOR_PIN), handle_speed_sensor_pin_int, CHANGE);
 
+  //for(int i = 0; i < EEPROM.length(); i++) EEPROM.write(i, 0);
+
   // Init configuration
   saved.load();
   
   // Initalize LEDs
   FastLED.addLeds<WS2812, LED_DISP_DATA_PIN, GRB>(leds, NUM_LEDS).setCorrection(TypicalLEDStrip);
+  FastLED.setMaxPowerInVoltsAndMilliamps(5, MAX_CURRENT_MA);
   FastLED.setBrightness(saved.led_brightness);  
   FastLED.show();
 
@@ -207,63 +218,60 @@ void loop() {
 
 void process_inputs()
 {
+  static bool needs_save = false;
+  static uint16_t last_save_time = 0;
+  
   // Accept serial commands over bluetooth
   if(Serial.available() > 0) {
     char cmd = Serial.read();
-    Serial.print(cmd);
     
-    if(cmd == 'd') {
-      //update_display(bt_serial_read_arg());
+    if(cmd == 'd') { // Set speed display
+      update_display(bt_serial_read_arg());
       
-    } else if(cmd == 'e') {
+    } else if(cmd == 'e') { // Enable speed display
       saved.speed_enable = bt_serial_read_arg();
-      saved.save();
       
     } else if(cmd == 'b') {
       saved.led_brightness = bt_serial_read_arg();
       FastLED.setBrightness(saved.led_brightness);
       led_show_scaled();
-      saved.save();
       
-    } else if(cmd == 's') {
+    } else if(cmd == 's') { // Set LED brightness scaling
       for(uint8_t i = 0; i < NUM_SECTIONS; i++) {
         saved.led_scale[i] = bt_serial_read_arg();
       }      
       
       led_show_scaled();
-      saved.save();
       
-    } else if(cmd == 'p') {
+    } else if(cmd == 'p') { // Set LED pattern
       uint8_t layer = bt_serial_read_arg() % N_PATTERN_LAYERS;
       saved.layers[layer].num = bt_serial_read_arg();
       for(uint8_t i = 0; i < N_PATTERN_ARGS; i++) {
         saved.layers[layer].arg[i] = bt_serial_read_arg();
       }
-      saved.save();
 
       layers_updated = true;
-    } else if(cmd == 'a') {
+    } else if(cmd == 'a') { // Set LED animation speed
       uint8_t layer = bt_serial_read_arg() % N_PATTERN_LAYERS;
       saved.layers[layer].speed = bt_serial_read_arg();
-      saved.save();
 
-    } else if(cmd == 't') {
+    } else if(cmd == 't') { // Set LED animation step
       uint8_t layer = bt_serial_read_arg() % N_PATTERN_LAYERS;
       saved.layers[layer].step = bt_serial_read_arg();
-      saved.save();
 
-    } else if(cmd == 'l') {
-      Serial.println(F("0:off"));
+    } else if(cmd == 'l') { // List patterns
+      Serial.println(F("l0,off"));
       for(uint8_t i = 0; i < arr_len(patterns); i++) {
+        Serial.print('l');
         Serial.print(i + 1);
-        Serial.print(':');
+        Serial.print(',');
         Serial.println(patterns[i].name);
       }
 
-    } else if(cmd == 'c') {
+    } else if(cmd == 'c') { // Show current configuration
       saved.print_state();
       
-    } else if(cmd == 'h') {
+    } else if(cmd == 'h') { // Help
       Serial.print(F("\n"
         "e<1|0>: Enable speed display\n"
         "d<val>: Set speed display\n"
@@ -276,6 +284,19 @@ void process_inputs()
         "l: Show patterns\n"
         ));
     }
+
+    // Acknowledge message
+    Serial.println('.');
+
+    // Save after commands
+    needs_save = true;
+  }
+
+  // To avoid burning out our EEPROM with rapid slider changes only commit changes every second
+  if(needs_save && last_save_time != seconds16()) {
+    saved.save();
+    needs_save = false;
+    last_save_time = seconds16();
   }
 }
 
@@ -288,7 +309,8 @@ void update_speed()
 
   if(speed_sensor_triggered) {
     speed_sensor_triggered = false;
-    
+
+    // Based on 700C wheel and 25mm tire
     float speed_calculated = 2.0 * M_PI * 335.0 / 1609344.0 / (elapsed_time / 3600000.0f);
     speed_mph = (uint8_t)speed_calculated;
     speed_norm = (uint8_t)min(speed_calculated / 20.0 * 255.0, 255.0);
@@ -298,6 +320,7 @@ void update_speed()
 
   if(elapsed_time >= 4000) {
     speed_mph = 0;
+    speed_norm = 0;
   }
 }
 
@@ -326,17 +349,29 @@ void shift_digit(int tube_num, int digit) {
 // Write number to nixie tube display
 void update_display(uint8_t num)
 {
+  static unsigned long last_update_time = 0;
+  
   if(displayed_number == num) return;
-  displayed_number = num;
+
+  unsigned long curr_time = millis();  
+  if(curr_time < last_update_time + 100) return;
+
+  last_update_time = curr_time;
+  
+  if(displayed_number > num) {
+    displayed_number--;
+  } else {
+    displayed_number++;
+  }
   
   shift_digit(LEFT_TUBE, 10);
-  if(num == 255) {
+  if(displayed_number == 255) {
     // If 255 show blank display
     shift_digit(LEFT_TUBE, 10);
     shift_digit(RIGHT_TUBE, 10);    
   } else {
-    shift_digit(LEFT_TUBE, (num / 10) % 10);
-    shift_digit(RIGHT_TUBE, num % 10);
+    shift_digit(LEFT_TUBE, (displayed_number / 10) % 10);
+    shift_digit(RIGHT_TUBE, displayed_number % 10);
   }
 
   digitalWrite(DISP_LATCH_PIN, HIGH);
@@ -359,8 +394,6 @@ int bt_serial_read_arg()
 {
   int arg = Serial.parseInt();
   Serial.read(); // Consume separator
-  Serial.print(arg);
-  Serial.print(',');
   
   return arg;
 }
@@ -385,7 +418,7 @@ void update_layers()
   // If no layer requires an update, nothing to do
   if(!update_required) return;
 
-  for(uint8_t layer_idx = 0; layer_idx < N_PATTERN_LAYERS; layer_idx++) {
+  for(layer_idx = 0; layer_idx < N_PATTERN_LAYERS; layer_idx++) {
     const PatternLayer & layer = saved.layers[layer_idx];
 
     // Nothing to do if this is an empty layer
@@ -406,99 +439,171 @@ void update_layers()
 }
 
 // Blink the back section of the bike
-void pattern_blinky(uint8_t anim_idx, const PatternLayer & layer)
+void pattern_blinky(uint8_t & anim_idx, const PatternLayer & layer)
 {
-  static bool on = anim_idx % 2 == 0;
-
-  if(on || layer.step == 0) {
-    fill_solid(leds + L_BACK_START, L_BACK_NUM, CHSV(layer.arg[0], 255, 255));
+  if(squarewave8(anim_idx, layer.arg[2])) {
+    fill_solid(leds + L_BACK_START, L_BACK_NUM, CHSV(layer.arg[0], layer.arg[1], 255));
   }
 }
 
 // Random variations in value
-void pattern_noise(uint8_t anim_idx, const PatternLayer & layer)
+void pattern_noise(uint8_t & anim_idx, const PatternLayer & layer)
 {
+  static uint8_t last_idx = anim_idx;
+  static uint8_t scale[NUM_LEDS];
+
+  if(anim_idx != last_idx) {
+    for(uint8_t i = 0; i < NUM_LEDS; i++) {
+      scale[i] = random8(layer.arg[0]);
+    }
+    last_idx = anim_idx;
+  }
+
   for(uint8_t i = 0; i < NUM_LEDS; i++) {
-    leds[i] = CHSV(layer.arg[0], 255, random8());
+    //CHSV color = leds[i];
+    leds[i].nscale8_video(255 - scale[i]);
   }
 }
 
 // Solid color
-void pattern_solid(uint8_t anim_idx, const PatternLayer & layer)
+void pattern_solid(uint8_t & anim_idx, const PatternLayer & layer)
 {
   fill_solid(leds, NUM_LEDS, CHSV(layer.arg[0], layer.arg[1], layer.arg[2]));
 }
 
-void pattern_solid_rgb(uint8_t anim_idx, const PatternLayer & layer)
+void pattern_solid_rgb(uint8_t & anim_idx, const PatternLayer & layer)
 {
   fill_solid(leds, NUM_LEDS, CRGB(layer.arg[0], layer.arg[1], layer.arg[2]));
 }
 
 // Small group of LEDs circles the strip
-void pattern_chase(uint8_t anim_idx, const PatternLayer & layer)
+void pattern_chase(uint8_t & anim_idx, const PatternLayer & layer)
 {
+  if(anim_idx >= NUM_LEDS) anim_idx = 0;
+  
   uint8_t hue = layer.arg[0];
-  leds[(anim_idx + 0) % NUM_LEDS] = CHSV(hue, 255, 50);
-  leds[(anim_idx + 1) % NUM_LEDS] = CHSV(hue, 255, 128);
-  leds[(anim_idx + 2) % NUM_LEDS] = CHSV(hue, 255, 255);
-  leds[(anim_idx + 3) % NUM_LEDS] = CHSV(hue, 255, 128);
-  leds[(anim_idx + 3) % NUM_LEDS] = CHSV(hue, 255, 50);
+  uint8_t len = min(layer.arg[1], NUM_LEDS);
+
+  for(uint8_t i = 0; i < len; i++) {
+    leds[(anim_idx + i) % NUM_LEDS] = CHSV(hue, 255, 255);
+  }
 }
 
 // Color pulse moves to the back of the bike from the top and bottom simultaneously
-void pattern_chase2(uint8_t anim_idx, const PatternLayer & layer)
+void pattern_chase2(uint8_t & anim_idx, const PatternLayer & layer)
 {
-  uint8_t len = min(L_TOP_NUM + L_BACK_NUM, L_DOWN_NUM + L_CHAIN_NUM);
+  uint8_t max_top = L_TOP_NUM + L_BACK_NUM;
+  uint8_t max_bottom = L_DOWN_NUM + L_CHAIN_NUM;
+  uint8_t max_len = min(max_top, max_bottom);
+  uint8_t hue = layer.arg[0];
+  uint8_t len = min(layer.arg[1], max_len);
 
-  leds[(anim_idx + 0) % len] = CHSV(layer.arg[0], 255, 128);
-  leds[(anim_idx + 1) % len] = CHSV(layer.arg[0], 255, 255);
-  leds[NUM_LEDS - (anim_idx + 1) % len - 1] = CHSV(layer.arg[0], 255, 255);
-  leds[NUM_LEDS - (anim_idx + 0) % len - 1] = CHSV(layer.arg[0], 255, 128);
-}
+  if(anim_idx >= max_len) anim_idx = 0;
 
-// Pulse from max value to black
-void pattern_pulse(uint8_t anim_idx, const PatternLayer & layer)
-{
-  nscale8(leds, NUM_LEDS, cubicwave8(anim_idx++));
+  for(uint8_t i = 0; i < len; i++) {
+    leds[(anim_idx + i) % max_top] = CHSV(hue, 255, 255);
+    leds[NUM_LEDS - (anim_idx + i) % max_bottom - 1] = CHSV(hue, 255, 255);
+  }
 }
 
 // Pulse from max value to 1/4 value
-void pattern_pulse2(uint8_t anim_idx, const PatternLayer & layer)
+void pattern_pulse(uint8_t & anim_idx, const PatternLayer & layer)
 {
-  nscale8(leds, NUM_LEDS, qadd8(cubicwave8(anim_idx++) / 4 * 3, 64));
+  nscale8(leds, NUM_LEDS, map8(cubicwave8(anim_idx), layer.arg[0], 255));
 }
 
 // Show either all rainbow colors around the strip or cycle between all colors
-void pattern_rainbow(uint8_t anim_idx, const PatternLayer & layer)
+void pattern_rainbow(uint8_t & anim_idx, const PatternLayer & layer)
 {
-  fill_rainbow(leds, NUM_LEDS, anim_idx++, 255 / NUM_LEDS);
+  fill_rainbow(leds, NUM_LEDS, anim_idx, 255 / NUM_LEDS);
 }
 
-void pattern_rainbow2(uint8_t anim_idx, const PatternLayer & layer)
+void pattern_rainbow2(uint8_t & anim_idx, const PatternLayer & layer)
 {
-  fill_solid(leds, NUM_LEDS, CHSV(anim_idx++, 255, layer.arg[1]));
+  fill_solid(leds, NUM_LEDS, CHSV(anim_idx, layer.arg[0], layer.arg[1]));
 }
 
-void overlay_speed_mult(uint8_t anim_idx, const PatternLayer & layer)
+void pattern_multi_band(uint8_t anim_idx, const PatternLayer & layer, CRGB pattern[], uint8_t n_colors, uint8_t pat_len)
 {
+  pat_len = constrain(pat_len, 1, NUM_LEDS);
+    
+  for(uint8_t i = 0, pat_idx = 0; i < NUM_LEDS; i++) {
+    if(i % pat_len == 0 && NUM_LEDS - i > pat_len / 2) {
+      pat_idx = (pat_idx + 1) % n_colors;
+    }
+
+    CRGB color = pattern[pat_idx];
+    if(color.r != 0 || color.g != 0 || color.b != 0) {
+      leds[(i + anim_idx) % NUM_LEDS] = color;
+    }
+  }
+}
+
+void pattern_murica(uint8_t & anim_idx, const PatternLayer & layer) {
+  CRGB pattern[] = {CRGB::Red, CRGB::White, CRGB::Blue};
+  
+  pattern_multi_band(anim_idx, layer, pattern, arr_len(pattern), layer.arg[0]);
+}
+
+void pattern_dual_ants(uint8_t & anim_idx, const PatternLayer & layer) {
+  CRGB pattern[] = {CHSV(layer.arg[1], 255, 255), CHSV(layer.arg[2], 255, 255), CRGB::Black};
+  
+  pattern_multi_band(anim_idx, layer, pattern, arr_len(pattern), layer.arg[0]);
+}
+
+void pattern_rainbow3(uint8_t & anim_idx, const PatternLayer & layer) {
+  CRGB pattern[] = {CRGB::Red, CRGB::Orange, CRGB::Yellow, CRGB::Green, CRGB::Blue, CRGB::Indigo, CRGB::Violet};
+  
+  pattern_multi_band(anim_idx, layer, pattern, arr_len(pattern), layer.arg[0]);
+}
+
+void pattern_ants(uint8_t & anim_idx, const PatternLayer & layer) {
+  uint8_t hue = layer.arg[0];
+  uint8_t on_len = layer.arg[1];
+  uint8_t off_len = layer.arg[2];
+
+  if(anim_idx >= NUM_LEDS) anim_idx = 0;
+
+  for(uint8_t i = 0; i < NUM_LEDS; i += on_len + off_len) {
+    for(uint8_t j = 0; j < on_len; j++) {
+      leds[(i + j + anim_idx) % NUM_LEDS] = CHSV(hue, 255, 255);
+    }
+  }
+}
+
+void overlay_speed_mult(uint8_t & anim_idx, const PatternLayer & layer)
+{
+  uint8_t scale = dim8_raw(scale8(speed_norm, layer.arg[1] - layer.arg[0]) + layer.arg[0]);
   for(uint8_t i = 0; i < NUM_LEDS; i++) {
-    leds[i].nscale8(dim8_raw(speed_norm));
+    leds[i].nscale8(scale);
   }
 }
 
-void overlay_sparkle(uint8_t anim_idx, const PatternLayer & layer)
+void overlay_speed_fake(uint8_t & anim_idx, const PatternLayer & layer)
 {
-  static uint8_t last_anim_idx = 0;
-  static uint8_t last_led = 0;
-  if(anim_idx != last_anim_idx) {
-    last_led = random8(NUM_LEDS);
-    last_anim_idx = anim_idx;
-  }
-
-  leds[last_led] = CRGB::White;
+  speed_norm = layer.arg[0];
 }
 
-void overlay_sparkle2(uint8_t anim_idx, const PatternLayer & layer)
+void overlay_sparkle(uint8_t & anim_idx, const PatternLayer & layer)
+{
+  static const uint8_t MAX_SPARKLES = 5;
+  static uint8_t last_anim_idx[N_PATTERN_LAYERS];
+  static uint8_t last_leds[N_PATTERN_LAYERS][MAX_SPARKLES];
+  uint8_t n_sparkles = constrain(layer.arg[0], 1, MAX_SPARKLES);
+  
+  if(anim_idx != last_anim_idx[layer_idx]) {
+    for(uint8_t i = 0; i < n_sparkles; i++) {
+      last_leds[layer_idx][i] = random8(NUM_LEDS);
+    }
+    last_anim_idx[layer_idx] = anim_idx;
+  }
+
+  for(uint8_t i = 0; i < n_sparkles; i++) {
+    leds[last_leds[layer_idx][i]] = CHSV(layer.arg[1], layer.arg[2], 255);
+  }
+}
+
+void overlay_sparkle2(uint8_t & anim_idx, const PatternLayer & layer)
 {
   static uint8_t last_anim_idx = 0;
   static uint8_t last_led = 0;
@@ -510,7 +615,7 @@ void overlay_sparkle2(uint8_t anim_idx, const PatternLayer & layer)
   leds[last_led] = CRGB::White;  
 }
 
-void overlay_anim_speed(uint8_t anim_idx, const PatternLayer &layer) {
+void overlay_anim_speed(uint8_t & anim_idx, const PatternLayer &layer) {
   static uint8_t last_anim_idx;
 
   if(anim_idx == last_anim_idx) return;
